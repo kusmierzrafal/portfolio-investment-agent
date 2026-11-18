@@ -1,0 +1,28 @@
+# Virtual environment
+.venv/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+*.duckdb
+*.duckdb.wal
+
+# Secrets
+.env
+.env.*
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*~
+.DS_Store
