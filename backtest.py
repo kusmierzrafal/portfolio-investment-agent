@@ -1,8 +1,11 @@
-"""Equal-weight buy-and-hold backtest.
+"""Equal-weight portfolio backtests.
 
 Prices are the split-adjusted closes from ``market_data``. Dividends are the
-split-adjusted cash amounts from the same download and are not reinvested.
-Adjusted close is not used, so a dividend is not counted twice.
+split-adjusted cash amounts from the same download. Adjusted close is not
+used, so a dividend is not counted twice.
+
+Buy and hold invests once. Monthly rebalancing invests the same way, then
+returns to equal weights on the first common session of each later month.
 """
 
 from __future__ import annotations
@@ -32,12 +35,33 @@ class Position:
 
 
 @dataclass(frozen=True)
+class Transaction:
+    date: pd.Timestamp
+    symbol: str
+    side: str
+    shares: float
+    amount: float
+    fee: float
+
+
+@dataclass(frozen=True)
+class Holding:
+    symbol: str
+    shares: float
+    price: float
+    market_value: float
+
+
+@dataclass(frozen=True)
 class BacktestResult:
     purchase_date: pd.Timestamp
     initial_capital: float
     positions: tuple[Position, ...]
     benchmarks: tuple[Position, ...]
     values: pd.DataFrame
+    transactions: tuple[Transaction, ...] = ()
+    holdings: tuple[Holding, ...] = ()
+    cash: float = 0.0
 
 
 def total_return(final_value: float, initial_capital: float) -> float:
@@ -60,6 +84,22 @@ def maximum_drawdown(values: pd.Series) -> float:
     return float((values / peak - 1).min())
 
 
+def load_backtest_inputs(
+    symbols: list[str],
+    start: date,
+    end: date,
+    initial_capital: float,
+) -> tuple[tuple[str, ...], pd.DataFrame, pd.DataFrame]:
+    """Validate one request and download its closes and dividends once.
+
+    Several strategies can then be simulated from the returned frames.
+    """
+    selected = _validate_request(symbols, start, end, initial_capital)
+    needed = list(selected) + [symbol for symbol in BENCHMARKS if symbol not in selected]
+    prices, dividends = _load_market_data(needed, start, end)
+    return selected, prices, dividends
+
+
 def run_equal_weight_backtest(
     symbols: list[str],
     start: date,
@@ -71,9 +111,9 @@ def run_equal_weight_backtest(
     ``end`` is inclusive. SPY and DIA are simulated with the same capital,
     purchase session, and fee, and are not portfolio holdings.
     """
-    selected = _validate_request(symbols, start, end, initial_capital)
-    needed = list(selected) + [symbol for symbol in BENCHMARKS if symbol not in selected]
-    prices, dividends = _load_market_data(needed, start, end)
+    selected, prices, dividends = load_backtest_inputs(
+        symbols, start, end, initial_capital
+    )
     return simulate_equal_weight(
         prices,
         dividends,
@@ -176,6 +216,224 @@ def simulate_equal_weight(
         benchmarks=benchmarks,
         values=values,
     )
+
+
+def run_equal_weight_monthly_backtest(
+    symbols: list[str],
+    start: date,
+    end: date,
+    initial_capital: float,
+) -> BacktestResult:
+    """Download prices and simulate equal-weight monthly rebalancing.
+
+    The opening trade matches buy and hold. On the first common session of
+    each later calendar month, holdings are traded back to equal weights.
+    SPY and DIA stay buy-and-hold benchmarks.
+    """
+    selected, prices, dividends = load_backtest_inputs(
+        symbols, start, end, initial_capital
+    )
+    return simulate_equal_weight_monthly(
+        prices,
+        dividends,
+        selected,
+        initial_capital,
+        start,
+        end,
+    )
+
+
+def simulate_equal_weight_monthly(
+    prices: pd.DataFrame,
+    dividends: pd.DataFrame,
+    symbols: tuple[str, ...] | list[str],
+    initial_capital: float,
+    start: date,
+    end: date,
+) -> BacktestResult:
+    """Simulate equal weights with a rebalance on each later month's first session.
+
+    The opening purchase is the buy-and-hold purchase: equal allocations,
+    fractional shares, and the purchase fee taken from each allocation.
+    That session is not a rebalance. Each later rebalance trades at the close
+    so every selected stock has the same market value. Dividend cash already
+    received is part of that value. Fees are charged on the shares actually
+    bought or sold.
+    """
+    baseline = simulate_equal_weight(
+        prices,
+        dividends,
+        symbols,
+        initial_capital,
+        start,
+        end,
+    )
+    closes = _normalize_frame(prices, "Price data")
+    dividend_frame = _normalize_frame(dividends, "Dividend data")
+    dates = baseline.values.index
+    selected = [position.symbol for position in baseline.positions]
+    shares = {position.symbol: position.shares for position in baseline.positions}
+    cash = 0.0
+    transactions = [
+        Transaction(
+            date=baseline.purchase_date,
+            symbol=position.symbol,
+            side="BUY",
+            shares=position.shares,
+            amount=position.shares * position.price,
+            fee=position.fee,
+        )
+        for position in baseline.positions
+    ]
+
+    portfolio: list[float] = []
+    previous = None
+    for current in dates:
+        if previous is not None:
+            for symbol in selected:
+                cash += shares[symbol] * _cash_dividends(
+                    _dividend_series(dividend_frame, symbol),
+                    previous,
+                    current,
+                )
+        if _is_rebalance_date(current, baseline.purchase_date, dates):
+            trade_prices = {
+                symbol: float(closes.loc[current, symbol]) for symbol in selected
+            }
+            cash, trades = _rebalance_to_equal_weight(
+                shares,
+                trade_prices,
+                cash,
+                selected,
+                current,
+            )
+            transactions.extend(trades)
+        equity = sum(
+            shares[symbol] * float(closes.loc[current, symbol]) for symbol in selected
+        )
+        portfolio.append(equity + cash)
+        previous = current
+
+    values = baseline.values.copy()
+    values["Portfolio"] = pd.Series(portfolio, index=dates)
+    last = dates[-1]
+    holdings = tuple(
+        Holding(
+            symbol=symbol,
+            shares=shares[symbol],
+            price=float(closes.loc[last, symbol]),
+            market_value=shares[symbol] * float(closes.loc[last, symbol]),
+        )
+        for symbol in selected
+    )
+    return BacktestResult(
+        purchase_date=baseline.purchase_date,
+        initial_capital=baseline.initial_capital,
+        positions=baseline.positions,
+        benchmarks=baseline.benchmarks,
+        values=values,
+        transactions=tuple(transactions),
+        holdings=holdings,
+        cash=float(cash),
+    )
+
+
+def _is_rebalance_date(
+    current: pd.Timestamp,
+    purchase_date: pd.Timestamp,
+    dates: pd.DatetimeIndex,
+) -> bool:
+    """Return whether ``current`` is the first common session of a later month."""
+    if (current.year, current.month) <= (purchase_date.year, purchase_date.month):
+        return False
+    month = dates[(dates.year == current.year) & (dates.month == current.month)]
+    return len(month) > 0 and current == month[0]
+
+
+def _cash_dividends(
+    dividends: pd.Series,
+    after: pd.Timestamp,
+    through: pd.Timestamp,
+) -> float:
+    paid = dividends.fillna(0.0)
+    paid = paid.loc[(paid.index > after) & (paid.index <= through)]
+    if paid.empty:
+        return 0.0
+    return float(paid.sum())
+
+
+def _equal_market_value(market_values: list[float], cash: float) -> float:
+    """Return the equal post-trade market value that spends the available cash.
+
+    A buy spends gross cash and receives shares worth gross cash times
+    ``1 - fee``. A sale pays the fee out of the sale proceeds. The target is
+    the value at which those cash flows leave no uninvested cash.
+    """
+    wealth = sum(market_values) + cash
+    low = 0.0
+    high = wealth
+    for _ in range(64):
+        mid = (low + high) / 2.0
+        if _cash_after_equal_weight(market_values, cash, mid) > 0.0:
+            low = mid
+        else:
+            high = mid
+    return (low + high) / 2.0
+
+
+def _cash_after_equal_weight(
+    market_values: list[float],
+    cash: float,
+    target: float,
+) -> float:
+    retained = 1.0 - FEE_RATE
+    leftover = cash
+    for market_value in market_values:
+        traded = market_value - target
+        if traded > 0.0:
+            leftover += traded * retained
+        elif traded < 0.0:
+            leftover -= -traded / retained
+    return leftover
+
+
+def _rebalance_to_equal_weight(
+    shares: dict[str, float],
+    prices: dict[str, float],
+    cash: float,
+    symbols: list[str],
+    when: pd.Timestamp,
+) -> tuple[float, list[Transaction]]:
+    market_values = [shares[symbol] * prices[symbol] for symbol in symbols]
+    target = _equal_market_value(market_values, cash)
+    retained = 1.0 - FEE_RATE
+    trades: list[Transaction] = []
+    for symbol, market_value in zip(symbols, market_values):
+        sell_value = market_value - target
+        if sell_value <= 1e-6:
+            continue
+        sell_shares = min(shares[symbol], sell_value / prices[symbol])
+        sold_value = sell_shares * prices[symbol]
+        fee = sold_value * FEE_RATE
+        shares[symbol] -= sell_shares
+        cash += sold_value - fee
+        trades.append(Transaction(when, symbol, "SELL", sell_shares, sold_value, fee))
+    for symbol, market_value in zip(symbols, market_values):
+        buy_value = target - market_value
+        if buy_value <= 1e-6:
+            continue
+        gross = buy_value / retained
+        if gross > cash:
+            gross = cash
+        if gross <= 1e-6:
+            continue
+        fee = gross * FEE_RATE
+        bought_value = gross - fee
+        bought_shares = bought_value / prices[symbol]
+        shares[symbol] += bought_shares
+        cash -= gross
+        trades.append(Transaction(when, symbol, "BUY", bought_shares, bought_value, fee))
+    return cash, trades
 
 
 def _validate_request(

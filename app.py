@@ -12,8 +12,12 @@ from backtest import (
     FEE_RATE,
     BacktestError,
     BacktestResult,
+    Holding,
+    Transaction,
+    load_backtest_inputs,
     maximum_drawdown,
-    run_equal_weight_backtest,
+    simulate_equal_weight,
+    simulate_equal_weight_monthly,
     total_return,
 )
 from market_data import DOW_30, MarketDataError, download_daily_history
@@ -22,6 +26,9 @@ DEFAULT_TICKER = "NVDA"
 DEFAULT_START = date(2024, 1, 1)
 DEFAULT_END = date(2024, 12, 31)
 DEFAULT_CAPITAL = 10_000.0
+BUY_AND_HOLD = "Equal Weight Buy & Hold"
+MONTHLY_REBALANCE = "Equal Weight Monthly Rebalancing"
+STRATEGIES = [BUY_AND_HOLD, MONTHLY_REBALANCE]
 
 
 def _show_history(ticker: str, history) -> None:
@@ -136,9 +143,14 @@ def _show_market_explorer() -> None:
 
 def _show_backtest() -> None:
     st.header("Backtesting")
-    st.caption(
-        "Equal-weight buy and hold for selected Dow 30 stocks, compared with SPY and DIA."
+    chosen = st.multiselect(
+        "Strategies",
+        options=STRATEGIES,
+        default=STRATEGIES,
+        key="backtest_strategies",
     )
+    strategies = [name for name in STRATEGIES if name in chosen]
+    st.caption("Compare the selected Dow 30 strategies with SPY and DIA.")
     tickers = list(DOW_30)
     with st.form("backtest"):
         selected = st.multiselect(
@@ -163,47 +175,115 @@ def _show_backtest() -> None:
         submitted = st.form_submit_button("Run backtest", type="primary")
 
     with st.expander("How does this strategy work?", expanded=False):
-        _show_strategy_methodology()
+        _show_strategy_methodology(strategies)
 
-    if not submitted:
-        st.info("Select at least one stock, then run the backtest.")
+    if not submitted and st.session_state.get("backtest_shown_strategies") != tuple(strategies):
+        st.session_state.pop("backtest_results", None)
+        st.session_state.pop("backtest_shown_strategies", None)
+
+    if submitted:
+        if not strategies:
+            st.session_state.pop("backtest_results", None)
+            st.session_state.pop("backtest_shown_strategies", None)
+            st.error("Select at least one strategy.")
+            return
+        try:
+            with st.spinner("Downloading prices and running the backtest..."):
+                results = _run_selected(selected, start, end, capital, strategies)
+        except ValueError as exc:
+            st.session_state.pop("backtest_results", None)
+            st.session_state.pop("backtest_shown_strategies", None)
+            st.error(str(exc))
+            return
+        except (MarketDataError, BacktestError) as exc:
+            st.session_state.pop("backtest_results", None)
+            st.session_state.pop("backtest_shown_strategies", None)
+            st.warning(str(exc))
+            return
+        st.session_state["backtest_results"] = results
+        st.session_state["backtest_shown_strategies"] = tuple(strategies)
+
+    results = st.session_state.get("backtest_results")
+    if not results:
+        st.info("Select at least one stock and one strategy, then run the backtest.")
         return
+    _show_backtest_result(results)
 
-    try:
-        with st.spinner("Downloading prices and running the backtest..."):
-            result = run_equal_weight_backtest(selected, start, end, capital)
-    except ValueError as exc:
-        st.error(str(exc))
-    except (MarketDataError, BacktestError) as exc:
-        st.warning(str(exc))
+
+def _run_selected(
+    symbols: list[str],
+    start: date,
+    end: date,
+    capital: float,
+    strategies: list[str],
+) -> list[tuple[str, BacktestResult]]:
+    selected, prices, dividends = load_backtest_inputs(symbols, start, end, capital)
+    results: list[tuple[str, BacktestResult]] = []
+    if BUY_AND_HOLD in strategies:
+        results.append(
+            (
+                BUY_AND_HOLD,
+                simulate_equal_weight(prices, dividends, selected, capital, start, end),
+            )
+        )
+    if MONTHLY_REBALANCE in strategies:
+        results.append(
+            (
+                MONTHLY_REBALANCE,
+                simulate_equal_weight_monthly(prices, dividends, selected, capital, start, end),
+            )
+        )
+    _require_shared_calendar(results)
+    return results
+
+
+def _require_shared_calendar(results: list[tuple[str, BacktestResult]]) -> None:
+    first = results[0][1]
+    for _, result in results[1:]:
+        shared = (
+            result.purchase_date == first.purchase_date
+            and result.values.index.equals(first.values.index)
+            and result.values["SPY"].equals(first.values["SPY"])
+            and result.values["DIA"].equals(first.values["DIA"])
+        )
+        if not shared:
+            raise BacktestError(
+                "The strategies do not share a purchase date, trading calendar, and benchmarks."
+            )
+
+
+def _show_backtest_result(results: list[tuple[str, BacktestResult]]) -> None:
+    first = results[0][1]
+    names = [name for name, _ in results]
+    purchased = first.purchase_date.date().isoformat()
+    if names == [MONTHLY_REBALANCE]:
+        st.caption(
+            f"Bought at the close on {purchased}. "
+            "Rebalanced at the first common session of each later month."
+        )
+    elif names == [BUY_AND_HOLD]:
+        st.caption(f"Bought at the close on {purchased}. No later trades are made.")
     else:
-        _show_backtest_result(result)
+        st.caption(
+            f"Both strategies buy at the close on {purchased}. "
+            "Monthly rebalancing trades again on the first common session of each later month."
+        )
 
-
-def _show_backtest_result(result: BacktestResult) -> None:
-    portfolio = result.values["Portfolio"]
-    final_value = float(portfolio.iloc[-1])
-    st.caption(
-        f"Bought at the close on {result.purchase_date.date().isoformat()}. "
-        "No later trades are made."
-    )
-    return_column, drawdown_column, value_column = st.columns(3)
-    return_column.metric(
-        "Total return",
-        f"{total_return(final_value, result.initial_capital):+.2%}",
-    )
-    drawdown_column.metric("Maximum drawdown", f"{maximum_drawdown(portfolio):.2%}")
-    value_column.metric("Final portfolio value", f"${final_value:,.2f}")
+    chart = pd.DataFrame(index=first.values.index)
+    rows = []
+    for name, result in results:
+        series = result.values["Portfolio"]
+        chart[name] = series
+        rows.append(_summary_row(name, series, result.initial_capital))
+    for benchmark in BENCHMARKS:
+        series = first.values[benchmark]
+        chart[benchmark] = series
+        rows.append(_summary_row(benchmark, series, first.initial_capital))
 
     figure = go.Figure()
-    for name in result.values.columns:
+    for name in chart.columns:
         figure.add_trace(
-            go.Scatter(
-                x=result.values.index,
-                y=result.values[name],
-                mode="lines",
-                name=name,
-            )
+            go.Scatter(x=chart.index, y=chart[name], mode="lines", name=name)
         )
     figure.update_layout(
         title="Portfolio value",
@@ -212,33 +292,66 @@ def _show_backtest_result(result: BacktestResult) -> None:
         hovermode="x unified",
     )
     st.plotly_chart(figure)
-
-    comparison = pd.DataFrame(
-        [
-            {
-                "Series": name,
-                "Total return": total_return(float(series.iloc[-1]), result.initial_capital),
-                "Maximum drawdown": maximum_drawdown(series),
-                "Final value": float(series.iloc[-1]),
-            }
-            for name, series in result.values.items()
-        ]
-    )
     st.dataframe(
-        comparison,
+        pd.DataFrame(rows),
         hide_index=True,
         column_config={
+            "Final value": st.column_config.NumberColumn(format="dollar"),
             "Total return": st.column_config.NumberColumn(format="percent"),
             "Maximum drawdown": st.column_config.NumberColumn(format="percent"),
-            "Final value": st.column_config.NumberColumn(format="dollar"),
         },
     )
 
-    st.subheader("Initial allocations")
+    if len(names) == 1:
+        detail_name = names[0]
+    else:
+        if st.session_state.get("backtest_detail_strategy") not in names:
+            st.session_state["backtest_detail_strategy"] = names[0]
+        detail_name = st.selectbox("Details", names, key="backtest_detail_strategy")
+    _show_strategy_details(detail_name, dict(results)[detail_name])
+
+
+def _summary_row(name: str, series: pd.Series, initial_capital: float) -> dict:
+    final_value = float(series.iloc[-1])
+    return {
+        "Name": name,
+        "Final value": final_value,
+        "Total return": total_return(final_value, initial_capital),
+        "Maximum drawdown": maximum_drawdown(series),
+    }
+
+
+def _show_strategy_details(strategy: str, result: BacktestResult) -> None:
+    if strategy == MONTHLY_REBALANCE:
+        st.subheader("Holdings")
+        st.caption("Shares and prices at the last reported session.")
+        st.dataframe(
+            _holdings_table(result.holdings),
+            hide_index=True,
+            column_config={
+                "Shares": st.column_config.NumberColumn(format="%.4f"),
+                "Price": st.column_config.NumberColumn(format="dollar"),
+                "Market value": st.column_config.NumberColumn(format="dollar"),
+            },
+        )
+        st.caption(f"Cash: ${result.cash:,.2f}")
+    else:
+        st.subheader("Initial allocations")
+        st.dataframe(
+            _positions_table(result.positions),
+            hide_index=True,
+            column_config=_position_column_config(),
+        )
+    st.subheader("Transactions")
     st.dataframe(
-        _positions_table(result.positions),
+        _transactions_table(result),
         hide_index=True,
-        column_config=_position_column_config(),
+        column_config={
+            "Date": st.column_config.DateColumn("Date"),
+            "Shares": st.column_config.NumberColumn(format="%.4f"),
+            "Amount": st.column_config.NumberColumn(format="dollar"),
+            "Fee": st.column_config.NumberColumn(format="dollar"),
+        },
     )
     st.subheader("Benchmarks")
     st.caption("SPY and DIA are not portfolio holdings. Each is bought with the full initial capital.")
@@ -249,10 +362,11 @@ def _show_backtest_result(result: BacktestResult) -> None:
     )
 
     st.subheader("Daily portfolio value")
-    daily = result.values.reset_index()
+    daily = result.values.rename(columns={"Portfolio": strategy}).reset_index()
     value_format = {
         column: st.column_config.NumberColumn(format="dollar")
-        for column in result.values.columns
+        for column in daily.columns
+        if column != "Date"
     }
     st.dataframe(
         daily,
@@ -286,7 +400,62 @@ def _position_column_config() -> dict:
     }
 
 
-def _show_strategy_methodology() -> None:
+def _holdings_table(holdings: tuple[Holding, ...]) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "Symbol": holding.symbol,
+                "Shares": holding.shares,
+                "Price": holding.price,
+                "Market value": holding.market_value,
+            }
+            for holding in holdings
+        ]
+    )
+
+
+def _transactions_table(result: BacktestResult) -> pd.DataFrame:
+    trades = result.transactions or tuple(
+        Transaction(
+            date=result.purchase_date,
+            symbol=position.symbol,
+            side="BUY",
+            shares=position.shares,
+            amount=position.shares * position.price,
+            fee=position.fee,
+        )
+        for position in result.positions
+    )
+    return pd.DataFrame(
+        [
+            {
+                "Date": trade.date,
+                "Ticker": trade.symbol,
+                "Side": trade.side,
+                "Shares": trade.shares,
+                "Amount": trade.amount,
+                "Fee": trade.fee,
+            }
+            for trade in trades
+        ]
+    )
+
+
+def _show_strategy_methodology(strategies: list[str]) -> None:
+    if not strategies:
+        st.caption("Select a strategy.")
+        return
+    if BUY_AND_HOLD in strategies:
+        if len(strategies) > 1:
+            st.markdown(f"**{BUY_AND_HOLD}**")
+        _show_buy_and_hold_methodology()
+    if MONTHLY_REBALANCE in strategies:
+        if len(strategies) > 1:
+            st.markdown(f"**{MONTHLY_REBALANCE}**")
+        _show_monthly_methodology()
+
+
+def _show_buy_and_hold_methodology() -> None:
     fee = f"{FEE_RATE:.1%}"
     benchmarks = " and ".join(BENCHMARKS)
     st.markdown(
@@ -311,6 +480,34 @@ The portfolio buys the selected Dow 30 stocks once and holds them through the se
 **Statistics.** Total return is final value divided by initial capital, minus one, so the purchase fee reduces it. Maximum drawdown is the lowest value of value / running peak minus one. It is zero when value never declines. The running peak starts at the post-fee purchase value.
 
 **Limitations.** The simulation has no taxes, slippage, borrowing, or interest on dividend cash. It does not reinvest dividends, rebalance, short, or optimize weights. Results depend on Yahoo Finance for the requested range.
+"""
+        ).strip()
+    )
+
+
+def _show_monthly_methodology() -> None:
+    fee = f"{FEE_RATE:.1%}"
+    benchmarks = " and ".join(BENCHMARKS)
+    st.markdown(
+        textwrap.dedent(
+            f"""
+The portfolio opens like equal-weight buy and hold, then returns to equal weights at the first common session of each later month. The catalogue is the current static Dow 30 membership, not the historical index.
+
+**Opening trade.** Initial capital is split equally. Shares are bought at the close on the first session in the requested range when every selected stock and both benchmarks have a positive close. A {fee} fee is deducted from each allocation before the share count is calculated. Fractional shares are allowed. That session is not a rebalance.
+
+**Rebalance.** At the close of the first common session of each later calendar month, every selected stock is set to the same market value. The target uses the whole portfolio, including dividend cash. Overweight stocks are sold and underweight stocks are bought. A month with no common session is skipped. Nothing is traded after the selected end date.
+
+**Fees.** A {fee} fee is charged on the amount actually traded, on both buys and sells. A buy uses the opening-trade rule: the fee comes out of the cash spent, and the shares are the remainder divided by the close. A sale pays the fee out of the proceeds. A holding that is not traded pays no fee. Share quantities are solved so the fees can be paid from available cash, without spending more cash than is on hand and without selling more shares than are held.
+
+**Prices and dividends.** Positions are valued with the split-adjusted close (`Close`, requested with `auto_adjust=False`). Dividend cash comes from the `Dividends` column of the same download and is not also embedded in the close. Cash is held until the next rebalance, then included in the target. A dividend on the opening session is not received. A dividend on a rebalance session belongs to the shares held before that trade. If the ex-date is not a reported session, the cash is included on the next reported session.
+
+**Benchmarks.** {benchmarks} are not holdings and are not rebalanced. Each is a separate buy-and-hold of the full initial capital, purchased on the opening session, with the same fee and dividend treatment.
+
+**Reported sessions.** A session appears only when every selected stock and both benchmarks have a positive close. Sessions with missing prices are omitted rather than filled forward.
+
+**Statistics.** Total return is final value divided by initial capital, minus one. Maximum drawdown is the lowest value of value / running peak minus one. It is zero when value never declines. The running peak starts at the post-fee opening value.
+
+**Limitations.** The simulation has no taxes, slippage, borrowing, or interest on cash. It does not rebalance daily or yearly, short, or optimize weights. Results depend on Yahoo Finance for the requested range.
 """
         ).strip()
     )
