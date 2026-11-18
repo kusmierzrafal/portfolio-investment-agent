@@ -1,7 +1,7 @@
 """Portfolio Investment Agent."""
 
 import textwrap
-from datetime import date
+from datetime import date, timedelta
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -14,10 +14,13 @@ from backtest import (
     BacktestResult,
     Holding,
     Transaction,
+    MOMENTUM_LOOKBACK,
+    MOMENTUM_WARMUP_DAYS,
     load_backtest_inputs,
     maximum_drawdown,
     simulate_equal_weight,
     simulate_equal_weight_monthly,
+    simulate_momentum_monthly,
     total_return,
 )
 from market_data import DOW_30, MarketDataError, download_daily_history
@@ -28,7 +31,8 @@ DEFAULT_END = date(2024, 12, 31)
 DEFAULT_CAPITAL = 10_000.0
 BUY_AND_HOLD = "Equal Weight Buy & Hold"
 MONTHLY_REBALANCE = "Equal Weight Monthly Rebalancing"
-STRATEGIES = [BUY_AND_HOLD, MONTHLY_REBALANCE]
+MOMENTUM = "Momentum Monthly"
+STRATEGIES = [BUY_AND_HOLD, MONTHLY_REBALANCE, MOMENTUM]
 
 
 def _show_history(ticker: str, history) -> None:
@@ -217,7 +221,16 @@ def _run_selected(
     capital: float,
     strategies: list[str],
 ) -> list[tuple[str, BacktestResult]]:
-    selected, prices, dividends = load_backtest_inputs(symbols, start, end, capital)
+    history_start = None
+    if MOMENTUM in strategies:
+        history_start = start - timedelta(days=MOMENTUM_WARMUP_DAYS)
+    selected, prices, dividends = load_backtest_inputs(
+        symbols,
+        start,
+        end,
+        capital,
+        history_start=history_start,
+    )
     results: list[tuple[str, BacktestResult]] = []
     if BUY_AND_HOLD in strategies:
         results.append(
@@ -231,6 +244,13 @@ def _run_selected(
             (
                 MONTHLY_REBALANCE,
                 simulate_equal_weight_monthly(prices, dividends, selected, capital, start, end),
+            )
+        )
+    if MOMENTUM in strategies:
+        results.append(
+            (
+                MOMENTUM,
+                simulate_momentum_monthly(prices, dividends, selected, capital, start, end),
             )
         )
     _require_shared_calendar(results)
@@ -263,10 +283,22 @@ def _show_backtest_result(results: list[tuple[str, BacktestResult]]) -> None:
         )
     elif names == [BUY_AND_HOLD]:
         st.caption(f"Bought at the close on {purchased}. No later trades are made.")
-    else:
+    elif names == [MOMENTUM]:
+        st.caption(
+            f"Bought at the close on {purchased}. "
+            "That session and the first common session of each later month "
+            "hold the two stocks with the strongest 60-session momentum."
+        )
+    elif names == [BUY_AND_HOLD, MONTHLY_REBALANCE]:
         st.caption(
             f"Both strategies buy at the close on {purchased}. "
             "Monthly rebalancing trades again on the first common session of each later month."
+        )
+    else:
+        st.caption(
+            f"All selected strategies are invested from the close on {purchased}. "
+            "Momentum Monthly selects two stocks on that session and on the "
+            "first common session of each later month."
         )
 
     chart = pd.DataFrame(index=first.values.index)
@@ -322,7 +354,7 @@ def _summary_row(name: str, series: pd.Series, initial_capital: float) -> dict:
 
 
 def _show_strategy_details(strategy: str, result: BacktestResult) -> None:
-    if strategy == MONTHLY_REBALANCE:
+    if strategy != BUY_AND_HOLD:
         st.subheader("Holdings")
         st.caption("Shares and prices at the last reported session.")
         st.dataframe(
@@ -453,6 +485,10 @@ def _show_strategy_methodology(strategies: list[str]) -> None:
         if len(strategies) > 1:
             st.markdown(f"**{MONTHLY_REBALANCE}**")
         _show_monthly_methodology()
+    if MOMENTUM in strategies:
+        if len(strategies) > 1:
+            st.markdown(f"**{MOMENTUM}**")
+        _show_momentum_methodology()
 
 
 def _show_buy_and_hold_methodology() -> None:
@@ -508,6 +544,34 @@ The portfolio opens like equal-weight buy and hold, then returns to equal weight
 **Statistics.** Total return is final value divided by initial capital, minus one. Maximum drawdown is the lowest value of value / running peak minus one. It is zero when value never declines. The running peak starts at the post-fee opening value.
 
 **Limitations.** The simulation has no taxes, slippage, borrowing, or interest on cash. It does not rebalance daily or yearly, short, or optimize weights. Results depend on Yahoo Finance for the requested range.
+"""
+        ).strip()
+    )
+
+
+def _show_momentum_methodology() -> None:
+    fee = f"{FEE_RATE:.1%}"
+    benchmarks = " and ".join(BENCHMARKS)
+    st.markdown(
+        textwrap.dedent(
+            f"""
+The portfolio holds the two strongest stocks in the selected universe and replaces that pair at the first common session of each later month. At least three stocks are required. The catalogue is the current static Dow 30 membership, not the historical index.
+
+**Signal.** A stock's momentum is its last completed close divided by the close {MOMENTUM_LOOKBACK} trading sessions earlier, minus one. Only sessions strictly before the execution date are used. The execution close is not part of the ranking. The two highest returns are selected, even when both are negative. Equal returns are ordered alphabetically by ticker.
+
+**Execution.** The first trade is at the close of the same opening session as the other strategies. Momentum for that trade comes from sessions before the opening, including history downloaded before the selected start date. Later trades are at the close of the first common session of each new month. A stock that leaves the top two is sold. A stock that stays is traded back to half of the portfolio. Nothing is traded after the selected end date.
+
+**Allocation and fees.** Each winner receives half of the portfolio, including dividend cash already received. Fractional shares are allowed. Buys and sells pay a {fee} fee on the amount traded. A buy deducts the fee from the cash spent. A sale deducts the fee from the proceeds. The trade cannot spend more cash than is available or sell more shares than are held.
+
+**Prices and dividends.** Positions use the split-adjusted close (`Close`, requested with `auto_adjust=False`). Dividend cash comes from the `Dividends` column and is not also embedded in the close. Cash is held until the next rebalance. A dividend on the opening session is not received. A dividend on a rebalance session belongs to the shares held before that trade. Sessions downloaded only for the lookback are excluded from valuation, dividends, benchmarks, and reported performance.
+
+**Benchmarks.** {benchmarks} are not holdings and are not ranked. Each is a separate buy-and-hold of the full initial capital, purchased on the opening session, with the same fee and dividend treatment as the other strategies.
+
+**Reported sessions.** A session appears only when every selected stock and both benchmarks have a positive close. Sessions with missing prices are omitted rather than filled forward. If a stock does not have {MOMENTUM_LOOKBACK} completed sessions before an execution date, the backtest stops instead of shortening the lookback.
+
+**Statistics.** Total return is final value divided by initial capital, minus one. Maximum drawdown is the lowest value of value / running peak minus one. It is zero when value never declines. The running peak starts at the post-fee opening value.
+
+**Limitations.** The simulation has no taxes, slippage, borrowing, interest on cash, stop-loss, or cash held back because momentum is negative. It always holds two stocks, does not search for a better lookback, and does not rebalance daily or yearly. Weights can drift after the last rebalance. Results depend on Yahoo Finance for the requested range and the preceding lookback.
 """
         ).strip()
     )

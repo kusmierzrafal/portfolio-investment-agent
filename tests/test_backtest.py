@@ -1,4 +1,4 @@
-"""Deterministic tests for the equal-weight backtests."""
+"""Deterministic tests for the equal-weight and momentum backtests."""
 
 from __future__ import annotations
 
@@ -7,7 +7,13 @@ from datetime import date
 
 import pandas as pd
 
-from backtest import FEE_RATE, simulate_equal_weight, simulate_equal_weight_monthly
+from backtest import (
+    FEE_RATE,
+    BacktestError,
+    simulate_equal_weight,
+    simulate_equal_weight_monthly,
+    simulate_momentum_monthly,
+)
 
 START = date(2024, 1, 2)
 END = date(2024, 1, 5)
@@ -281,6 +287,204 @@ class MonthlyRebalanceTests(unittest.TestCase):
         self.assertTrue(held.values["SPY"].equals(monthly.values["SPY"]))
         self.assertTrue(held.values["DIA"].equals(monthly.values["DIA"]))
         self.assertFalse(held.values["Portfolio"].equals(monthly.values["Portfolio"]))
+
+
+class MomentumTests(unittest.TestCase):
+    def test_ranking_excludes_the_execution_close(self) -> None:
+        prior = pd.bdate_range(end="2024-01-31", periods=70)
+        feb1 = pd.Timestamp("2024-02-01")
+        feb15 = pd.Timestamp("2024-02-15")
+        mar1 = pd.Timestamp("2024-03-01")
+        index = prior.append(pd.DatetimeIndex([feb1, feb15, mar1]))
+        symbols = ["AAA", "BBB", "CCC"]
+        prices = pd.DataFrame(100.0, index=index, columns=[*symbols, "SPY", "DIA"])
+        feb_history = index[index < feb1]
+        mar_history = index[index < mar1]
+        feb_last, feb_lag, feb_off = feb_history[-1], feb_history[-61], feb_history[-60]
+        mar_last, mar_lag, mar_off = mar_history[-1], mar_history[-61], mar_history[-60]
+        self.assertEqual(len({feb_last, feb_lag, feb_off, mar_last, mar_lag, mar_off}), 6)
+
+        # February signal is negative for every stock. BBB leads, then AAA.
+        # The session one step inside the window and the execution close would
+        # select different winners.
+        prices.loc[feb_last, "AAA"] = 90
+        prices.loc[feb_last, "BBB"] = 95
+        prices.loc[feb_last, "CCC"] = 80
+        prices.loc[feb_off, "BBB"] = 1_000
+        prices.loc[feb1, "AAA"] = 10
+        prices.loc[feb1, "BBB"] = 10
+        prices.loc[feb1, "CCC"] = 1_000
+        # March: AAA leads and BBB ties CCC. Alphabetical order keeps BBB.
+        prices.loc[mar_last, "AAA"] = 150
+        prices.loc[mar_last, "BBB"] = 140
+        prices.loc[mar_last, "CCC"] = 140
+        prices.loc[mar_off, "BBB"] = 1_000
+        prices.loc[mar1, "AAA"] = 10
+        prices.loc[mar1, "BBB"] = 50
+        prices.loc[mar1, "CCC"] = 10_000
+        dividends = pd.DataFrame(0.0, index=index, columns=prices.columns)
+        dividends.loc[feb_last, "BBB"] = 1_000
+        start, end, capital = date(2024, 2, 1), date(2024, 3, 1), 2_000
+
+        result = simulate_momentum_monthly(prices, dividends, symbols, capital, start, end)
+        early = simulate_momentum_monthly(
+            prices, dividends, symbols, capital, start, date(2024, 2, 15)
+        )
+
+        def bought(backtest, when: pd.Timestamp) -> list[str]:
+            return sorted(
+                trade.symbol
+                for trade in backtest.transactions
+                if trade.date == when and trade.side == "BUY"
+            )
+
+        self.assertEqual(bought(result, feb1), ["AAA", "BBB"])
+        self.assertEqual(bought(early, feb1), ["AAA", "BBB"])
+        self.assertLess(prices.loc[feb_last, "BBB"] / prices.loc[feb_lag, "BBB"] - 1, 0)
+        self.assertLess(prices.loc[feb_last, "AAA"] / prices.loc[feb_lag, "AAA"] - 1, 0)
+        self.assertEqual({holding.symbol for holding in result.holdings}, {"AAA", "BBB"})
+        self.assertEqual(
+            {trade.date for trade in result.transactions},
+            {feb1, mar1},
+        )
+        self.assertTrue(result.values.index.equals(pd.DatetimeIndex([feb1, feb15, mar1])))
+        self.assertAlmostEqual(result.values.loc[feb1, "Portfolio"], capital * (1 - FEE_RATE))
+        self.assertAlmostEqual(result.cash, 0.0)
+
+        window = prices.loc[index >= feb1]
+        held_long = simulate_equal_weight(prices, dividends, symbols, capital, start, end)
+        held_window = simulate_equal_weight(
+            window, dividends.loc[window.index], symbols, capital, start, end
+        )
+        monthly_long = simulate_equal_weight_monthly(
+            prices, dividends, symbols, capital, start, end
+        )
+        monthly_window = simulate_equal_weight_monthly(
+            window, dividends.loc[window.index], symbols, capital, start, end
+        )
+        self.assertTrue(held_long.values.equals(held_window.values))
+        self.assertTrue(monthly_long.values.equals(monthly_window.values))
+        self.assertTrue(result.values["SPY"].equals(held_long.values["SPY"]))
+        self.assertTrue(result.values["DIA"].equals(held_long.values["DIA"]))
+        self.assertEqual(result.purchase_date, held_long.purchase_date)
+
+        short_prior = feb_history[-60:]
+        short_index = short_prior.append(index[index >= feb1])
+        with self.assertRaises(BacktestError) as missing:
+            simulate_momentum_monthly(
+                prices.loc[short_index],
+                dividends.loc[short_index],
+                symbols,
+                capital,
+                start,
+                end,
+            )
+        self.assertIn("not shortened", str(missing.exception))
+        self.assertIn("AAA", str(missing.exception))
+
+        tiny = pd.DataFrame(
+            {"AAA": [10.0], "BBB": [10.0], "SPY": [10.0], "DIA": [10.0]},
+            index=pd.to_datetime(["2024-02-01"]),
+        )
+        with self.assertRaisesRegex(ValueError, "at least 3"):
+            simulate_momentum_monthly(
+                tiny,
+                pd.DataFrame(0.0, index=tiny.index, columns=tiny.columns),
+                ["AAA", "BBB"],
+                capital,
+                start,
+                start,
+            )
+
+    def test_holding_change_preserves_cash_accounting(self) -> None:
+        prior = pd.bdate_range(end="2024-01-31", periods=61)
+        feb1 = pd.Timestamp("2024-02-01")
+        feb15 = pd.Timestamp("2024-02-15")
+        mar1 = pd.Timestamp("2024-03-01")
+        index = prior.append(pd.DatetimeIndex([feb1, feb15, mar1]))
+        symbols = ["AAA", "BBB", "CCC"]
+        prices = pd.DataFrame(10.0, index=index, columns=[*symbols, "SPY", "DIA"])
+        feb_history = index[index < feb1]
+        mar_history = index[index < mar1]
+        prices.loc[feb_history[-1], "BBB"] = 20
+        prices.loc[feb_history[-1], "CCC"] = 15
+        prices.loc[mar_history[-61], "AAA"] = 5
+        prices.loc[mar_history[-61], "BBB"] = 8
+        prices.loc[mar_history[-61], "CCC"] = 20
+        prices.loc[mar1, "BBB"] = 30
+        dividends = pd.DataFrame(0.0, index=index, columns=prices.columns)
+        dividends.loc[feb1, "BBB"] = 50
+        dividends.loc[feb15, "BBB"] = 2
+        copied_prices = prices.copy(deep=True)
+        copied_dividends = dividends.copy(deep=True)
+        start, end, capital = date(2024, 2, 1), date(2024, 3, 1), 2_000
+
+        held = simulate_equal_weight(prices, dividends, symbols, capital, start, end)
+        result = simulate_momentum_monthly(prices, dividends, symbols, capital, start, end)
+        again = simulate_momentum_monthly(prices, dividends, symbols, capital, start, end)
+        held_again = simulate_equal_weight(prices, dividends, symbols, capital, start, end)
+
+        self.assertTrue(prices.equals(copied_prices))
+        self.assertTrue(dividends.equals(copied_dividends))
+        self.assertTrue(result.values["Portfolio"].equals(again.values["Portfolio"]))
+        self.assertTrue(held.values.equals(held_again.values))
+        self.assertTrue(result.values["SPY"].equals(held.values["SPY"]))
+        self.assertEqual(result.purchase_date, held.purchase_date)
+        self.assertTrue(result.values.index.equals(held.values.index))
+
+        shares = capital / 2 * (1 - FEE_RATE) / 10
+        self.assertAlmostEqual(result.values.loc[feb1, "Portfolio"], capital * (1 - FEE_RATE))
+        opening = [trade for trade in result.transactions if trade.date == feb1]
+        self.assertEqual(sorted(trade.symbol for trade in opening), ["BBB", "CCC"])
+        for trade in opening:
+            self.assertEqual(trade.side, "BUY")
+            self.assertAlmostEqual(trade.shares, shares)
+            self.assertAlmostEqual(trade.amount, shares * 10)
+            self.assertAlmostEqual(trade.fee, capital / 2 * FEE_RATE)
+        self.assertAlmostEqual(
+            result.values.loc[feb15, "Portfolio"],
+            shares * 10 + shares * 10 + shares * 2,
+        )
+
+        keep = 1 - FEE_RATE
+        ccc_value = shares * 10
+        bbb_value = shares * 30
+        cash_after_sale = shares * 2 + ccc_value * keep
+        target = (cash_after_sale + bbb_value * keep) * keep / (1 + keep**2)
+        self.assertLess(target, bbb_value)
+        march = [trade for trade in result.transactions if trade.date == mar1]
+        sold_ccc = next(trade for trade in march if trade.symbol == "CCC")
+        sold_bbb = next(trade for trade in march if trade.symbol == "BBB")
+        bought_aaa = next(trade for trade in march if trade.symbol == "AAA")
+        self.assertEqual(sold_ccc.side, "SELL")
+        self.assertAlmostEqual(sold_ccc.shares, shares)
+        self.assertAlmostEqual(sold_ccc.amount, ccc_value)
+        self.assertAlmostEqual(sold_ccc.fee, ccc_value * FEE_RATE)
+        self.assertEqual(sold_bbb.side, "SELL")
+        self.assertAlmostEqual(sold_bbb.amount, bbb_value - target)
+        self.assertAlmostEqual(sold_bbb.fee, (bbb_value - target) * FEE_RATE)
+        self.assertLess(sold_bbb.shares, shares)
+        self.assertEqual(bought_aaa.side, "BUY")
+        self.assertAlmostEqual(bought_aaa.amount, target)
+        self.assertAlmostEqual(bought_aaa.fee, target / keep * FEE_RATE)
+        self.assertAlmostEqual(result.values.loc[mar1, "Portfolio"], target * 2)
+        self.assertAlmostEqual(result.cash, 0.0)
+        self.assertEqual([holding.symbol for holding in result.holdings], ["AAA", "BBB"])
+        self.assertAlmostEqual(result.holdings[0].market_value, target)
+        self.assertAlmostEqual(result.holdings[1].market_value, target)
+        self.assertAlmostEqual(
+            sum(holding.market_value for holding in result.holdings) + result.cash,
+            result.values.loc[mar1, "Portfolio"],
+        )
+
+        position = {"AAA": 0.0, "BBB": 0.0, "CCC": 0.0}
+        for trade in result.transactions:
+            sign = 1 if trade.side == "BUY" else -1
+            position[trade.symbol] += sign * trade.shares
+            self.assertGreaterEqual(position[trade.symbol], -1e-9)
+        self.assertAlmostEqual(position["CCC"], 0.0)
+        self.assertGreater(position["AAA"], 0.0)
+        self.assertGreater(position["BBB"], 0.0)
 
 
 if __name__ == "__main__":

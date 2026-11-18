@@ -1,4 +1,4 @@
-"""Equal-weight portfolio backtests.
+"""Equal-weight and momentum portfolio backtests.
 
 Prices are the split-adjusted closes from ``market_data``. Dividends are the
 split-adjusted cash amounts from the same download. Adjusted close is not
@@ -6,6 +6,8 @@ used, so a dividend is not counted twice.
 
 Buy and hold invests once. Monthly rebalancing invests the same way, then
 returns to equal weights on the first common session of each later month.
+Momentum Monthly holds the two stocks with the strongest 60-session return,
+using only sessions completed before each execution date.
 """
 
 from __future__ import annotations
@@ -19,6 +21,8 @@ from market_data import DOW_30, download_daily_history
 
 FEE_RATE = 0.001
 BENCHMARKS: tuple[str, ...] = ("SPY", "DIA")
+MOMENTUM_LOOKBACK = 60
+MOMENTUM_WARMUP_DAYS = 180
 
 
 class BacktestError(Exception):
@@ -89,14 +93,22 @@ def load_backtest_inputs(
     start: date,
     end: date,
     initial_capital: float,
+    history_start: date | None = None,
 ) -> tuple[tuple[str, ...], pd.DataFrame, pd.DataFrame]:
     """Validate one request and download its closes and dividends once.
 
     Several strategies can then be simulated from the returned frames.
+    ``history_start`` downloads earlier sessions when a signal needs them.
+    Portfolio valuation still begins at ``start``.
     """
     selected = _validate_request(symbols, start, end, initial_capital)
+    download_start = start if history_start is None else history_start
+    if history_start is not None and (
+        not isinstance(history_start, date) or history_start > start
+    ):
+        raise ValueError("The history start must be on or before the start date.")
     needed = list(selected) + [symbol for symbol in BENCHMARKS if symbol not in selected]
-    prices, dividends = _load_market_data(needed, start, end)
+    prices, dividends = _load_market_data(needed, download_start, end)
     return selected, prices, dividends
 
 
@@ -336,6 +348,165 @@ def simulate_equal_weight_monthly(
         holdings=holdings,
         cash=float(cash),
     )
+
+
+def simulate_momentum_monthly(
+    prices: pd.DataFrame,
+    dividends: pd.DataFrame,
+    symbols: tuple[str, ...] | list[str],
+    initial_capital: float,
+    start: date,
+    end: date,
+) -> BacktestResult:
+    """Hold the two strongest stocks and reset that pair each month.
+
+    The opening session is the same common session used by buy and hold.
+    On that close, and on the first common close of each later month, the
+    portfolio sells anything outside the new top two and puts half of its
+    value in each winner. Momentum uses only positive closes strictly before
+    the execution session. The portfolio stays invested when those returns are
+    negative.
+    """
+    baseline = simulate_equal_weight(
+        prices,
+        dividends,
+        symbols,
+        initial_capital,
+        start,
+        end,
+    )
+    selected = [position.symbol for position in baseline.positions]
+    if len(selected) < 3:
+        raise ValueError("Momentum Monthly needs at least 3 stocks.")
+
+    closes = _normalize_frame(prices, "Price data")
+    dividend_frame = _normalize_frame(dividends, "Dividend data")
+    dates = baseline.values.index
+    purchase = baseline.purchase_date
+    shares = {symbol: 0.0 for symbol in selected}
+    cash = float(baseline.initial_capital)
+    transactions: list[Transaction] = []
+    portfolio: list[float] = []
+    previous = None
+    for current in dates:
+        if previous is not None:
+            for symbol in selected:
+                cash += shares[symbol] * _cash_dividends(
+                    _dividend_series(dividend_frame, symbol),
+                    previous,
+                    current,
+                )
+        if current == purchase or _is_rebalance_date(current, purchase, dates):
+            winners = _select_momentum(closes, selected, current)
+            trade_prices = {
+                symbol: float(closes.loc[current, symbol]) for symbol in selected
+            }
+            cash, trades = _invest_in_winners(
+                shares,
+                trade_prices,
+                cash,
+                winners,
+                current,
+            )
+            transactions.extend(trades)
+        equity = sum(
+            shares[symbol] * float(closes.loc[current, symbol]) for symbol in selected
+        )
+        portfolio.append(equity + cash)
+        previous = current
+
+    values = baseline.values.copy()
+    values["Portfolio"] = pd.Series(portfolio, index=dates)
+    last = dates[-1]
+    holdings = tuple(
+        Holding(
+            symbol=symbol,
+            shares=shares[symbol],
+            price=float(closes.loc[last, symbol]),
+            market_value=shares[symbol] * float(closes.loc[last, symbol]),
+        )
+        for symbol in selected
+        if shares[symbol] > 0.0
+    )
+    opening = tuple(
+        Position(
+            symbol=trade.symbol,
+            allocation=baseline.initial_capital / 2,
+            price=float(closes.loc[purchase, trade.symbol]),
+            shares=trade.shares,
+            fee=trade.fee,
+        )
+        for trade in transactions
+        if trade.date == purchase and trade.side == "BUY"
+    )
+    return BacktestResult(
+        purchase_date=purchase,
+        initial_capital=baseline.initial_capital,
+        positions=opening,
+        benchmarks=baseline.benchmarks,
+        values=values,
+        transactions=tuple(transactions),
+        holdings=holdings,
+        cash=float(cash),
+    )
+
+
+def _select_momentum(
+    closes: pd.DataFrame,
+    symbols: list[str],
+    as_of: pd.Timestamp,
+) -> list[str]:
+    """Return the top two symbols by completed 60-session return.
+
+    Equal returns are ordered by ticker. The execution session is excluded.
+    """
+    ranked: list[tuple[float, str]] = []
+    when = pd.Timestamp(as_of).date().isoformat()
+    for symbol in symbols:
+        history = closes.loc[closes.index < as_of, symbol].dropna()
+        history = history[history > 0]
+        if len(history) <= MOMENTUM_LOOKBACK:
+            raise BacktestError(
+                f"Not enough completed sessions before {when} to compute "
+                f"{MOMENTUM_LOOKBACK}-session momentum for {symbol}. "
+                "The lookback was not shortened."
+            )
+        momentum = float(history.iloc[-1] / history.iloc[-1 - MOMENTUM_LOOKBACK] - 1)
+        ranked.append((momentum, symbol))
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    return [symbol for _, symbol in ranked[:2]]
+
+
+def _invest_in_winners(
+    shares: dict[str, float],
+    prices: dict[str, float],
+    cash: float,
+    winners: list[str],
+    when: pd.Timestamp,
+) -> tuple[float, list[Transaction]]:
+    """Sell stocks that left the top two, then split the portfolio across it."""
+    trades: list[Transaction] = []
+    chosen = set(winners)
+    for symbol in list(shares):
+        if symbol in chosen or shares[symbol] <= 0.0:
+            continue
+        sold_value = shares[symbol] * prices[symbol]
+        sold_shares = shares[symbol]
+        shares[symbol] = 0.0
+        if sold_value <= 1e-6:
+            continue
+        fee = sold_value * FEE_RATE
+        cash += sold_value - fee
+        trades.append(Transaction(when, symbol, "SELL", sold_shares, sold_value, fee))
+    cash, rebalance = _rebalance_to_equal_weight(
+        shares,
+        prices,
+        cash,
+        winners,
+        when,
+    )
+    trades.extend(rebalance)
+    return cash, trades
 
 
 def _is_rebalance_date(
