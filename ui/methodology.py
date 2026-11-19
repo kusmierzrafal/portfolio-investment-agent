@@ -5,6 +5,7 @@ import textwrap
 import streamlit as st
 
 from backtesting.engine import BENCHMARKS, FEE_RATE
+from strategies.llm import LLM_STRATEGIES
 from strategies.momentum import MOMENTUM_LOOKBACK
 
 BUY_AND_HOLD = "Equal Weight Buy & Hold"
@@ -28,6 +29,10 @@ def show_strategy_methodology(strategies: list[str]) -> None:
         if len(strategies) > 1:
             st.markdown(f"**{MOMENTUM}**")
         _show_momentum_methodology()
+    if any(name in LLM_STRATEGIES for name in strategies):
+        if len(strategies) > 1:
+            st.markdown("**LLM strategies**")
+        _show_llm_methodology()
 
 
 def _show_buy_and_hold_methodology() -> None:
@@ -111,6 +116,20 @@ The portfolio holds the two strongest stocks in the selected universe and replac
 **Statistics.** Total return is final value divided by initial capital, minus one. Maximum drawdown is the lowest value of value / running peak minus one. It is zero when value never declines. The running peak starts at the post-fee opening value.
 
 **Limitations.** The simulation has no taxes, slippage, borrowing, interest on cash, stop-loss, or cash held back because momentum is negative. It always holds two stocks, does not search for a better lookback, and does not rebalance daily or yearly. Weights can drift after the last rebalance. Results depend on Yahoo Finance for the requested range and the preceding lookback.
+"""
+        ).strip()
+    )
+
+
+def _show_llm_methodology() -> None:
+    st.markdown(
+        textwrap.dedent(
+            """
+The model chooses weights at the opening close and at the first common close of each later month. It sees one scaled close series per stock: the last 60 completed sessions, plus the close that starts that window. Each series begins at 100. The request contains no dates and no raw prices.
+
+Identified strategies also send the ticker and company name. Anonymized strategies send only a synthetic ID, such as A01, and the scaled series. Fully invested strategies cannot hold cash. CASH Allowed strategies may put any share of the portfolio in cash, including all of it.
+
+Python rejects weights that use an unknown ID, are negative or not finite, or do not sum to 1. It also rejects cash when the strategy is fully invested. A rejected response stops the backtest. Accepted weights then use the same fees, dividends, and benchmarks as the other strategies.
 """
         ).strip()
     )

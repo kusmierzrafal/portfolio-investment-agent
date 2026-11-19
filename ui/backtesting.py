@@ -1,5 +1,6 @@
 """Backtesting page: configuration, run, and results."""
 
+import os
 from datetime import date, timedelta
 
 import pandas as pd
@@ -18,6 +19,13 @@ from backtesting.engine import (
 )
 from data.market import DOW_30, MarketDataError
 from strategies.equal_weight import buy_and_hold_decision, monthly_rebalance_decision
+from strategies.llm import (
+    DEFAULT_MODEL,
+    LLM_HISTORY_DAYS,
+    LLM_SETTINGS,
+    LLM_STRATEGIES,
+    llm_decision,
+)
 from strategies.momentum import MOMENTUM_WARMUP_DAYS, momentum_decision
 from ui.methodology import (
     BUY_AND_HOLD,
@@ -29,7 +37,8 @@ from ui.methodology import (
 DEFAULT_START = date(2024, 1, 1)
 DEFAULT_END = date(2024, 12, 31)
 DEFAULT_CAPITAL = 10_000.0
-STRATEGIES = [BUY_AND_HOLD, MONTHLY_REBALANCE, MOMENTUM]
+ORIGINAL_STRATEGIES = [BUY_AND_HOLD, MONTHLY_REBALANCE, MOMENTUM]
+STRATEGIES = ORIGINAL_STRATEGIES + list(LLM_STRATEGIES)
 
 
 def show_backtest() -> None:
@@ -37,7 +46,7 @@ def show_backtest() -> None:
     chosen = st.multiselect(
         "Strategies",
         options=STRATEGIES,
-        default=STRATEGIES,
+        default=ORIGINAL_STRATEGIES,
         key="backtest_strategies",
     )
     strategies = [name for name in STRATEGIES if name in chosen]
@@ -63,6 +72,16 @@ def show_backtest() -> None:
             step=100.0,
             key="backtest_capital",
         )
+        if any(name in LLM_STRATEGIES for name in strategies):
+            st.subheader("LLM settings")
+            api_key = st.text_input(
+                "OpenAI API key",
+                type="password",
+                key="backtest_openai_api_key",
+            )
+            model = st.text_input("Model ID", value=DEFAULT_MODEL, key="backtest_openai_model")
+        else:
+            api_key, model = "", DEFAULT_MODEL
         submitted = st.form_submit_button("Run backtest", type="primary")
 
     with st.expander("How does this strategy work?", expanded=False):
@@ -72,15 +91,36 @@ def show_backtest() -> None:
         st.session_state.pop("backtest_results", None)
         st.session_state.pop("backtest_shown_strategies", None)
 
+    guidance = st.empty()
     if submitted:
         if not strategies:
             st.session_state.pop("backtest_results", None)
             st.session_state.pop("backtest_shown_strategies", None)
             st.error("Select at least one strategy.")
             return
+        guidance.empty()
         try:
-            with st.spinner("Downloading prices and running the backtest..."):
-                results = _run_selected(selected, start, end, capital, strategies)
+            if any(name in LLM_STRATEGIES for name in strategies):
+                results = _run_llm_backtest(
+                    selected,
+                    start,
+                    end,
+                    capital,
+                    strategies,
+                    model=model,
+                    api_key=api_key,
+                )
+            else:
+                with st.spinner("Downloading prices and running the backtest..."):
+                    results = _run_selected(
+                        selected,
+                        start,
+                        end,
+                        capital,
+                        strategies,
+                        model=model,
+                        api_key=api_key,
+                    )
         except ValueError as exc:
             st.session_state.pop("backtest_results", None)
             st.session_state.pop("backtest_shown_strategies", None)
@@ -96,7 +136,7 @@ def show_backtest() -> None:
 
     results = st.session_state.get("backtest_results")
     if not results:
-        st.info("Select at least one stock and one strategy, then run the backtest.")
+        guidance.info("Select at least one stock and one strategy, then run the backtest.")
         return
     _show_backtest_result(results)
 
@@ -107,10 +147,22 @@ def _run_selected(
     end: date,
     capital: float,
     strategies: list[str],
+    *,
+    model: str,
+    api_key: str,
+    progress: "_LlmProgress | None" = None,
 ) -> list[tuple[str, BacktestResult]]:
     history_start = None
     if MOMENTUM in strategies:
         history_start = start - timedelta(days=MOMENTUM_WARMUP_DAYS)
+    llm_names = [name for name in strategies if name in LLM_STRATEGIES]
+    resolved_key = ""
+    if llm_names:
+        resolved_key = _require_llm_credentials(model, api_key)
+        llm_start = start - timedelta(days=LLM_HISTORY_DAYS)
+        history_start = llm_start if history_start is None else min(history_start, llm_start)
+    if progress is not None:
+        progress.downloading()
     selected, prices, dividends = load_backtest_inputs(
         symbols,
         start,
@@ -118,11 +170,22 @@ def _run_selected(
         capital,
         history_start=history_start,
     )
+    if progress is not None:
+        progress.ready(prices, selected, start, end, len(llm_names))
     decisions = {
         BUY_AND_HOLD: buy_and_hold_decision,
         MONTHLY_REBALANCE: monthly_rebalance_decision,
         MOMENTUM: momentum_decision,
     }
+    for name in llm_names:
+        identified, allow_cash = LLM_SETTINGS[name]
+        decide = llm_decision(
+            identified=identified,
+            allow_cash=allow_cash,
+            model=model.strip(),
+            api_key=resolved_key,
+        )
+        decisions[name] = decide if progress is None else progress.wrap(name, decide)
     results = [
         (
             name,
@@ -132,6 +195,157 @@ def _run_selected(
     ]
     _require_shared_calendar(results)
     return results
+
+
+def _run_llm_backtest(
+    symbols: list[str],
+    start: date,
+    end: date,
+    capital: float,
+    strategies: list[str],
+    *,
+    model: str,
+    api_key: str,
+) -> list[tuple[str, BacktestResult]]:
+    with st.status("Running the backtest.", expanded=True) as status:
+        progress = _LlmProgress(status)
+        try:
+            results = _run_selected(
+                symbols,
+                start,
+                end,
+                capital,
+                strategies,
+                model=model,
+                api_key=api_key,
+                progress=progress,
+            )
+        except Exception:
+            progress.fail()
+            raise
+        progress.finish()
+        return results
+
+
+def llm_decision_dates(
+    prices: pd.DataFrame,
+    symbols: tuple[str, ...] | list[str],
+    start: date,
+    end: date,
+) -> list[pd.Timestamp]:
+    """Sessions where the engine asks for a decision.
+
+    That is the first common session in the range, then the first common
+    session of each later month. A session counts only when every selected
+    stock and both benchmarks have a positive close.
+    """
+    required = list(symbols) + [symbol for symbol in BENCHMARKS if symbol not in symbols]
+    closes = prices.copy()
+    closes.index = pd.DatetimeIndex(pd.to_datetime(closes.index))
+    if closes.index.tz is not None:
+        closes.index = closes.index.tz_localize(None)
+    closes.index = closes.index.normalize()
+    closes = closes.sort_index()
+    window = closes.loc[
+        (closes.index >= pd.Timestamp(start)) & (closes.index <= pd.Timestamp(end)),
+        required,
+    ]
+    available = (window.notna() & (window > 0)).all(axis=1)
+    dates = window.index[available]
+    if len(dates) == 0:
+        return []
+    purchase = dates[0]
+    decisions = [purchase]
+    for current in dates[1:]:
+        if (current.year, current.month) <= (purchase.year, purchase.month):
+            continue
+        month = dates[(dates.year == current.year) & (dates.month == current.month)]
+        if len(month) > 0 and current == month[0]:
+            decisions.append(current)
+    return decisions
+
+
+def expected_llm_calls(
+    prices: pd.DataFrame,
+    symbols: tuple[str, ...] | list[str],
+    start: date,
+    end: date,
+    strategy_count: int,
+) -> int:
+    """Monthly decision dates times the number of selected LLM strategies."""
+    return len(llm_decision_dates(prices, symbols, start, end)) * strategy_count
+
+
+def track_llm_decision(decide, on_waiting, on_completed):
+    """Call the model, then record the decision only if it returns."""
+
+    def wrapped(as_of, history, symbols, is_opening):
+        on_waiting(as_of)
+        weights = decide(as_of, history, symbols, is_opening)
+        on_completed(as_of)
+        return weights
+
+    return wrapped
+
+
+class _LlmProgress:
+    def __init__(self, status) -> None:
+        self.status = status
+        self.completed = 0
+        self.total = 0
+        self.bar = None
+
+    def downloading(self) -> None:
+        self.status.update(label="Downloading historical market data.", state="running")
+
+    def ready(self, prices, symbols, start: date, end: date, strategy_count: int) -> None:
+        self.total = expected_llm_calls(prices, symbols, start, end, strategy_count)
+        self.bar = self.status.progress(0.0, text=self._text())
+        self.status.update(label=self._text(), state="running")
+
+    def wrap(self, name: str, decide):
+        def on_waiting(as_of) -> None:
+            when = pd.Timestamp(as_of).strftime("%Y-%m-%d")
+            self.status.update(
+                label=f"{name} — {when}. Waiting for OpenAI response.",
+                state="running",
+            )
+
+        def on_completed(as_of) -> None:
+            del as_of
+            self.completed += 1
+            fraction = 0.0 if self.total == 0 else self.completed / self.total
+            self.bar.progress(fraction, text=self._text())
+            self.status.update(label=self._text(), state="running")
+
+        return track_llm_decision(decide, on_waiting, on_completed)
+
+    def finish(self) -> None:
+        self.status.update(label="Completed", state="complete", expanded=False)
+
+    def fail(self) -> None:
+        self.status.update(label="Failed", state="error", expanded=True)
+
+    def _text(self) -> str:
+        return f"{self.completed} / {self.total} LLM decisions"
+
+
+def _require_llm_credentials(model: str, api_key: str) -> str:
+    resolved_key = _api_key(api_key)
+    if not resolved_key:
+        raise ValueError(
+            "Add an OpenAI API key, or set OPENAI_API_KEY, to run an LLM strategy."
+        )
+    if not model.strip():
+        raise ValueError("Enter a model ID.")
+    return resolved_key
+
+
+def _api_key(typed: str) -> str:
+    cleaned = typed.strip()
+    if cleaned:
+        return cleaned
+    return os.environ.get("OPENAI_API_KEY", "").strip()
 
 
 def _require_shared_calendar(results: list[tuple[str, BacktestResult]]) -> None:
@@ -170,6 +384,12 @@ def _show_backtest_result(results: list[tuple[str, BacktestResult]]) -> None:
         st.caption(
             f"Both strategies buy at the close on {purchased}. "
             "Monthly rebalancing trades again on the first common session of each later month."
+        )
+    elif any(name in LLM_STRATEGIES for name in names):
+        st.caption(
+            f"All selected strategies are invested from the close on {purchased}. "
+            "LLM strategies choose weights on that session and on the first common "
+            "session of each later month."
         )
     else:
         st.caption(

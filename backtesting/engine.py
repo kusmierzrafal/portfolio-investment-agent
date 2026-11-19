@@ -17,7 +17,7 @@ from data.market import DOW_30, download_closes_and_dividends
 FEE_RATE = 0.001
 BENCHMARKS: tuple[str, ...] = ("SPY", "DIA")
 CASH = "CASH"
-_WEIGHT_TOLERANCE = 1e-8
+WEIGHT_TOLERANCE = 1e-8
 _DUST = 1e-6
 
 
@@ -374,7 +374,7 @@ def _target_weights(
         cleaned[symbol] = float(value)
         if symbol != CASH and float(value) > 0.0 and symbol not in order:
             order.append(symbol)
-    if abs(sum(cleaned.values()) - 1.0) > _WEIGHT_TOLERANCE:
+    if abs(sum(cleaned.values()) - 1.0) > WEIGHT_TOLERANCE:
         raise BacktestError("Target weights must sum to 1.")
     targets = {symbol: cleaned.get(symbol, 0.0) for symbol in symbols}
     targets[CASH] = cleaned.get(CASH, 0.0)
