@@ -115,6 +115,28 @@ def download_daily_history(ticker: str, start: date, end: date) -> pd.DataFrame:
     return history
 
 
+def download_closes_and_dividends(
+    symbols: list[str],
+    start: date,
+    end: date,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Download split-adjusted closes and cash dividends for several tickers.
+
+    Close is the split-adjusted price. Dividends stay in their own column, so
+    a later valuation does not count a dividend twice.
+    """
+    closes: dict[str, pd.Series] = {}
+    dividends: dict[str, pd.Series] = {}
+    for symbol in symbols:
+        history = download_daily_history(symbol, start, end)
+        closes[symbol] = history["Close"]
+        if "Dividends" in history.columns:
+            dividends[symbol] = history["Dividends"]
+        else:
+            dividends[symbol] = pd.Series(0.0, index=history.index)
+    return pd.DataFrame(closes), pd.DataFrame(dividends)
+
+
 def _unavailable(symbol: str, start: date, end: date) -> str:
     return (
         f"No price data is available for {symbol} "

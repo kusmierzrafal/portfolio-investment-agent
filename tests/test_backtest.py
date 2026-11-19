@@ -7,13 +7,27 @@ from datetime import date
 
 import pandas as pd
 
-from backtest import (
-    FEE_RATE,
-    BacktestError,
-    simulate_equal_weight,
-    simulate_equal_weight_monthly,
-    simulate_momentum_monthly,
-)
+from backtesting.engine import FEE_RATE, BacktestError, simulate
+from strategies.equal_weight import buy_and_hold_decision, monthly_rebalance_decision
+from strategies.momentum import momentum_decision
+
+
+def simulate_equal_weight(prices, dividends, symbols, initial_capital, start, end):
+    return simulate(
+        prices, dividends, symbols, initial_capital, start, end, buy_and_hold_decision
+    )
+
+
+def simulate_equal_weight_monthly(prices, dividends, symbols, initial_capital, start, end):
+    return simulate(
+        prices, dividends, symbols, initial_capital, start, end, monthly_rebalance_decision
+    )
+
+
+def simulate_momentum_monthly(prices, dividends, symbols, initial_capital, start, end):
+    return simulate(
+        prices, dividends, symbols, initial_capital, start, end, momentum_decision
+    )
 
 START = date(2024, 1, 2)
 END = date(2024, 1, 5)
@@ -485,6 +499,104 @@ class MomentumTests(unittest.TestCase):
         self.assertAlmostEqual(position["CCC"], 0.0)
         self.assertGreater(position["AAA"], 0.0)
         self.assertGreater(position["BBB"], 0.0)
+
+
+class EngineWeightTests(unittest.TestCase):
+    def test_arbitrary_weights_leave_uninvested_cash(self) -> None:
+        index = _dates("2024-01-02", "2024-02-03")
+        prices = _prices(
+            {
+                "AAA": [10.0, 10.0],
+                "BBB": [20.0, 20.0],
+                "SPY": [10.0, 10.0],
+                "DIA": [10.0, 10.0],
+            },
+            index,
+        )
+        capital = 1_000.0
+
+        def decide(as_of, history, symbols, is_opening):
+            del as_of, history, symbols
+            if is_opening:
+                return {"AAA": 0.4, "BBB": 0.3, "CASH": 0.3}
+            return {"AAA": 0.5, "CASH": 0.5}
+
+        result = simulate(
+            prices,
+            _flat_dividends(prices),
+            ["AAA", "BBB"],
+            capital,
+            date(2024, 1, 2),
+            date(2024, 2, 3),
+            decide,
+        )
+
+        keep = 1 - FEE_RATE
+        opening = capital / (0.7 / keep + 0.3)
+        self.assertAlmostEqual(result.values.iloc[0]["Portfolio"], opening)
+        self.assertAlmostEqual(result.positions[0].shares * 10, 0.4 * opening)
+        self.assertAlmostEqual(result.positions[1].shares * 20, 0.3 * opening)
+        self.assertEqual([trade.side for trade in result.transactions[:2]], ["BUY", "BUY"])
+        self.assertNotIn("SELL", [trade.side for trade in result.transactions[:2]])
+
+        aaa_before = 0.4 * opening
+        bbb_before = 0.3 * opening
+        cash_before = 0.3 * opening
+        scale = (cash_before + bbb_before * keep + aaa_before / keep) / (0.5 * (1 / keep + 1))
+        self.assertGreater(0.5 * scale, aaa_before)
+        sold = next(
+            trade
+            for trade in result.transactions
+            if trade.symbol == "BBB" and trade.side == "SELL"
+        )
+        bought = next(
+            trade for trade in result.transactions if trade.date == index[1] and trade.symbol == "AAA"
+        )
+        self.assertEqual(sold.side, "SELL")
+        self.assertAlmostEqual(sold.amount, bbb_before)
+        self.assertAlmostEqual(sold.fee, bbb_before * FEE_RATE)
+        self.assertEqual(bought.side, "BUY")
+        self.assertAlmostEqual(bought.amount, 0.5 * scale - aaa_before)
+        self.assertAlmostEqual(bought.fee, (0.5 * scale - aaa_before) / keep * FEE_RATE)
+        self.assertAlmostEqual(result.values.iloc[1]["Portfolio"], scale)
+        self.assertAlmostEqual(result.cash, 0.5 * scale)
+        self.assertEqual([holding.symbol for holding in result.holdings], ["AAA"])
+        self.assertAlmostEqual(result.holdings[0].market_value, 0.5 * scale)
+        self.assertAlmostEqual(
+            result.holdings[0].market_value + result.cash,
+            result.values.iloc[1]["Portfolio"],
+        )
+        self.assertAlmostEqual(result.values.iloc[1]["SPY"], capital * keep)
+
+        def overweight(as_of, history, symbols, is_opening):
+            del as_of, history, symbols, is_opening
+            return {"AAA": 0.8, "BBB": 0.8}
+
+        with self.assertRaisesRegex(BacktestError, "sum to 1"):
+            simulate(
+                prices,
+                _flat_dividends(prices),
+                ["AAA", "BBB"],
+                capital,
+                date(2024, 1, 2),
+                date(2024, 1, 2),
+                overweight,
+            )
+
+        def short(as_of, history, symbols, is_opening):
+            del as_of, history, symbols, is_opening
+            return {"AAA": -0.2, "BBB": 1.2}
+
+        with self.assertRaisesRegex(BacktestError, "nonnegative"):
+            simulate(
+                prices,
+                _flat_dividends(prices),
+                ["AAA", "BBB"],
+                capital,
+                date(2024, 1, 2),
+                date(2024, 1, 2),
+                short,
+            )
 
 
 if __name__ == "__main__":
