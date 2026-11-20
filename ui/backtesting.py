@@ -27,6 +27,7 @@ from strategies.llm import (
     llm_decision,
 )
 from strategies.momentum import MOMENTUM_WARMUP_DAYS, momentum_decision
+from strategies.tracing import backtest_trace, strategy_span
 from ui.methodology import (
     BUY_AND_HOLD,
     MOMENTUM,
@@ -186,13 +187,18 @@ def _run_selected(
             api_key=resolved_key,
         )
         decisions[name] = decide if progress is None else progress.wrap(name, decide)
-    results = [
-        (
-            name,
-            simulate(prices, dividends, selected, capital, start, end, decisions[name]),
-        )
-        for name in strategies
-    ]
+    results = []
+    for name in strategies:
+        if name in LLM_STRATEGIES:
+            with strategy_span(name):
+                result = simulate(
+                    prices, dividends, selected, capital, start, end, decisions[name]
+                )
+        else:
+            result = simulate(
+                prices, dividends, selected, capital, start, end, decisions[name]
+            )
+        results.append((name, result))
     _require_shared_calendar(results)
     return results
 
@@ -209,17 +215,19 @@ def _run_llm_backtest(
 ) -> list[tuple[str, BacktestResult]]:
     with st.status("Running the backtest.", expanded=True) as status:
         progress = _LlmProgress(status)
+        llm_names = [name for name in strategies if name in LLM_STRATEGIES]
         try:
-            results = _run_selected(
-                symbols,
-                start,
-                end,
-                capital,
-                strategies,
-                model=model,
-                api_key=api_key,
-                progress=progress,
-            )
+            with backtest_trace(model.strip(), llm_names):
+                results = _run_selected(
+                    symbols,
+                    start,
+                    end,
+                    capital,
+                    strategies,
+                    model=model,
+                    api_key=api_key,
+                    progress=progress,
+                )
         except Exception:
             progress.fail()
             raise
@@ -296,12 +304,16 @@ class _LlmProgress:
         self.bar = None
 
     def downloading(self) -> None:
-        self.status.update(label="Downloading historical market data.", state="running")
+        self.status.update(
+            label="Downloading historical market data.",
+            state="running",
+            expanded=True,
+        )
 
     def ready(self, prices, symbols, start: date, end: date, strategy_count: int) -> None:
         self.total = expected_llm_calls(prices, symbols, start, end, strategy_count)
+        self.status.update(label=self._text(), state="running", expanded=True)
         self.bar = self.status.progress(0.0, text=self._text())
-        self.status.update(label=self._text(), state="running")
 
     def wrap(self, name: str, decide):
         def on_waiting(as_of) -> None:
@@ -309,14 +321,15 @@ class _LlmProgress:
             self.status.update(
                 label=f"{name} — {when}. Waiting for OpenAI response.",
                 state="running",
+                expanded=True,
             )
+            self._show(f"{self._text()} — {name} — {when}")
 
         def on_completed(as_of) -> None:
             del as_of
             self.completed += 1
-            fraction = 0.0 if self.total == 0 else self.completed / self.total
-            self.bar.progress(fraction, text=self._text())
-            self.status.update(label=self._text(), state="running")
+            self.status.update(label=self._text(), state="running", expanded=True)
+            self._show(self._text())
 
         return track_llm_decision(decide, on_waiting, on_completed)
 
@@ -325,6 +338,10 @@ class _LlmProgress:
 
     def fail(self) -> None:
         self.status.update(label="Failed", state="error", expanded=True)
+
+    def _show(self, text: str) -> None:
+        fraction = 0.0 if self.total == 0 else self.completed / self.total
+        self.bar.progress(fraction, text=text)
 
     def _text(self) -> str:
         return f"{self.completed} / {self.total} LLM decisions"

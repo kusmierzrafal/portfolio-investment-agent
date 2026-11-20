@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import math
+from contextvars import ContextVar
 from dataclasses import dataclass
 
 import pandas as pd
@@ -24,6 +25,12 @@ from openai import (
 
 from backtesting.engine import WEIGHT_TOLERANCE, BacktestError, CASH
 from data.market import DOW_30
+from strategies.tracing import traced_decision
+
+_call_usage: ContextVar[tuple[dict[str, int] | None, dict[str, float] | None] | None] = ContextVar(
+    "llm_call_usage",
+    default=None,
+)
 
 IDENTIFIED_INVESTED = "LLM Identified — Fully Invested"
 IDENTIFIED_CASH = "LLM Identified — CASH Allowed"
@@ -72,21 +79,43 @@ def llm_decision(
 ):
     """Return a decide(as_of, history, symbols, is_opening) function."""
     caller = complete_openai if complete is None else complete
+    strategy = _strategy_name(identified, allow_cash)
 
     def decide(as_of, history, symbols, is_opening):
         del is_opening
-        request = build_allocation_request(
-            history,
-            symbols,
-            as_of,
-            identified=identified,
-            allow_cash=allow_cash,
-        )
-        raw = caller(model, api_key, request.messages, request.schema)
-        weights = validate_allocation(raw, request.permitted, allow_cash=allow_cash)
-        return translate_weights(weights, request.id_to_symbol)
+        when = pd.Timestamp(as_of).strftime("%Y-%m-%d")
+        _call_usage.set(None)
+        request = None
+        raw = None
+        with traced_decision(strategy, model, when) as record:
+            try:
+                request = build_allocation_request(
+                    history,
+                    symbols,
+                    as_of,
+                    identified=identified,
+                    allow_cash=allow_cash,
+                )
+                record.started(request)
+                raw = caller(model, api_key, request.messages, request.schema)
+                usage, cost = _call_usage.get() or (None, None)
+                weights = validate_allocation(raw, request.permitted, allow_cash=allow_cash)
+                allocations = translate_weights(weights, request.id_to_symbol)
+                record.finished(raw, weights, allocations, usage, cost)
+                return allocations
+            except Exception as exc:
+                usage, cost = _call_usage.get() or (None, None)
+                record.failed(request, raw, exc, usage, cost)
+                raise
 
     return decide
+
+
+def _strategy_name(identified: bool, allow_cash: bool) -> str:
+    for name, settings in LLM_SETTINGS.items():
+        if settings == (identified, allow_cash):
+            return name
+    return "LLM"
 
 
 def build_allocation_request(
@@ -160,9 +189,43 @@ def translate_weights(weights: dict[str, float], id_to_symbol: dict[str, str]) -
     return translated
 
 
+def _openai_failure(exc: Exception) -> str:
+    """Exception type and HTTP status only. The message and request can contain secrets."""
+    detail = type(exc).__name__
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        detail = f"{detail}, HTTP {status}"
+    code = _openai_error_code(exc)
+    if code:
+        detail = f"{detail}, {code}"
+    return f"The OpenAI request failed ({detail})."
+
+
+def _openai_error_code(exc: Exception) -> str | None:
+    candidates: list[object] = [getattr(exc, "code", None), getattr(exc, "type", None)]
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        error = body.get("error")
+        if isinstance(error, dict):
+            candidates.extend((error.get("code"), error.get("type")))
+        candidates.extend((body.get("code"), body.get("type")))
+    for value in candidates:
+        if isinstance(value, str) and _safe_error_code(value):
+            return value
+    return None
+
+
+def _safe_error_code(value: str) -> bool:
+    if not value or len(value) > 80 or any(character.isspace() for character in value):
+        return False
+    lowered = value.lower()
+    return "sk-" not in lowered and "key" not in lowered and "bearer" not in lowered and "authorization" not in lowered
+
+
 def complete_openai(model: str, api_key: str, messages, schema: dict) -> dict:
     """Request one structured allocation. The API key is not included in errors."""
-    client = OpenAI(api_key=api_key)
+    client = OpenAI(api_key=api_key, max_retries=5)
+    _call_usage.set(None)
     try:
         response = client.responses.create(
             model=model,
@@ -181,7 +244,8 @@ def complete_openai(model: str, api_key: str, messages, schema: dict) -> dict:
     except NotFoundError as exc:
         raise BacktestError("The model ID is not available.") from exc
     except (APIConnectionError, APITimeoutError, RateLimitError, APIError) as exc:
-        raise BacktestError("The OpenAI request failed.") from exc
+        raise BacktestError(_openai_failure(exc)) from exc
+    _call_usage.set(_usage_and_cost(response))
     if getattr(response, "status", None) == "incomplete":
         raise BacktestError("The model returned an incomplete allocation.")
     message = next(
@@ -202,6 +266,29 @@ def complete_openai(model: str, api_key: str, messages, schema: dict) -> dict:
     if not isinstance(parsed, dict):
         raise BacktestError("The model returned an allocation that was not an object.")
     return parsed
+
+
+def _usage_and_cost(response) -> tuple[dict[str, int] | None, dict[str, float] | None]:
+    """Token counts from the response. Cost is included only when the response has it."""
+    usage = getattr(response, "usage", None)
+    details: dict[str, int] = {}
+    if usage is not None:
+        for source, key in (("input_tokens", "input"), ("output_tokens", "output")):
+            value = getattr(usage, source, None)
+            if isinstance(value, int) and not isinstance(value, bool):
+                details[key] = value
+        cached = getattr(getattr(usage, "input_tokens_details", None), "cached_tokens", None)
+        if isinstance(cached, int) and not isinstance(cached, bool):
+            details["cache_read_input_tokens"] = cached
+    cost = getattr(response, "cost", None)
+    cost_details = None
+    if isinstance(cost, dict):
+        cost_details = {
+            str(key): float(value)
+            for key, value in cost.items()
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
+        } or None
+    return (details or None), cost_details
 
 
 def _shared_window(history: pd.DataFrame, symbols: tuple[str, ...], as_of) -> pd.DataFrame:

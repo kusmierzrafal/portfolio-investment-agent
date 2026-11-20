@@ -16,6 +16,16 @@ Select an LLM strategy in Backtesting. Set the model ID. Paste an OpenAI API key
 
 The model receives the last 61 scaled closing prices for each stock. Identified strategies also receive the ticker and company name. Anonymized strategies do not. Fully invested strategies allocate only to the selected stocks. CASH Allowed strategies may also allocate to cash.
 
+Tracing is optional. Export these before starting the app to send one Langfuse trace per LLM backtest:
+
+```bash
+export LANGFUSE_PUBLIC_KEY="pk-lf-..."
+export LANGFUSE_SECRET_KEY="sk-lf-..."
+export LANGFUSE_BASE_URL="https://cloud.langfuse.com"
+```
+
+Leave them unset to run without tracing. The OpenAI key is not sent to Langfuse. Anonymized prompts still omit tickers; the ticker mapping is stored only on the trace. Token usage is recorded when the model response includes it, and Langfuse can price known models from that usage.
+
 ## Layout
 
 - `data/` defines the current Dow 30 catalogue in code and downloads split-adjusted closes and cash dividends.
